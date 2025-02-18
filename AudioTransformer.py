@@ -9,14 +9,14 @@ from torch import nn, einsum
 
 from torchaudio.transforms import Spectrogram, TimeStretch, FrequencyMasking, TimeMasking
 
-from audiolm_pytorch import AudioLM
-from audiolm_pytorch.utils import AudioConditionerBase
+#from audiolm_pytorch import AudioLM
+#from audiolm_pytorch.utils import AudioConditionerBase
 
 import torch.distributed as dist
-from musiclm_pytorch.distributed import AllGather
+#from musiclm_pytorch.distributed import AllGather
 
-from x_clip.tokenizer import tokenizer
-from vector_quantize_pytorch import ResidualVQ
+#from x_clip.tokenizer import tokenizer
+#from vector_quantize_pytorch import ResidualVQ
 
 from einops import rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Rearrange
@@ -536,3 +536,14 @@ class AudioSpectrogramTransformer(nn.Module):
             return out
 
         return out, all_layers
+
+if __name__ == '__main__':
+    audio_transformer = AudioSpectrogramTransformer(
+    dim = 512,
+    depth = 6,
+    heads = 8,
+    dim_head = 64,
+    spec_n_fft = 128,
+    spec_win_length = 24,
+    spec_aug_stretch_factor = 0.8
+)
