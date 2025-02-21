@@ -217,6 +217,7 @@ class Audiotransformer(nn.module):
         super().__init__()
         self.patch_size = pair(patch_size)
         self.dim = dim
+        self.depth = depth
 
         #spectogram 라이브러리 사용
         self.spec = Spectrogram(
