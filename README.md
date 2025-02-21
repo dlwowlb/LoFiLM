@@ -4,7 +4,7 @@ Reimplementation and Finetunning using https://github.com/lucidrains/audiolm-pyt
 
 Todo
 
-- [ ]  audiospectogramtransformer 모듈 만들기
+- [v]  audiospectogramtransformer 모듈 만들기
 - [ ]  texttransformer 모듈 만들기
 - [ ]  위 두 개의 모듈로 임베딩 추출, Mulan을 통해 공통된 latent 차원으로 변환
 - [ ]  Mulan 모델은 text, audio 두 modality의 임베딩 간의 유사성을 contrastive loss를 통해 학습
