@@ -1,86 +1,26 @@
-import math
-from functools import wraps, partial
-
-##Test
-
+from einops import rearrange, repeat, reduce
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn, einsum
 
 from torchaudio.transforms import Spectrogram, TimeStretch, FrequencyMasking, TimeMasking
 
-#from audiolm_pytorch import AudioLM
-#from audiolm_pytorch.utils import AudioConditionerBase
+#patch size가 16이면 16x16 크기의 patch로
+def pair(t):
+    return (t, t) if not isinstance(t, tuple) else t
 
-import torch.distributed as dist
-#from musiclm_pytorch.distributed import AllGather
-
-#from x_clip.tokenizer import tokenizer
-#from vector_quantize_pytorch import ResidualVQ
-
-from einops import rearrange, repeat, reduce, pack, unpack
-from einops.layers.torch import Rearrange
-
-from beartype.typing import List, Optional, Tuple
-from beartype import beartype
-
-# functions
-
-def exists(val):
-    return val is not None
-
-def first(it):
-    return it[0]
-
-def default(val, d):
-    return val if exists(val) else d
-
+#n을 divisor로 나눈 후 가장 가까운 정수로 내림 
 def round_down_nearest_multiple(n, divisor):
     return n // divisor * divisor
 
-def Sequential(*modules):
-    return nn.Sequential(*filter(exists, modules))
-
-# decorators
-
-def once(fn):
-    called = False
-    @wraps(fn)
-    def inner(x):
-        nonlocal called
-        if called:
-            return
-        called = True
-        return fn(x)
-    return inner
-
-print_once = once(print)
-
-# tensor functions
-
-def log(t, eps = 1e-20):
-    return torch.log(t.clamp(min = eps))
-
-def l2norm(t):
-    return F.normalize(t, p = 2, dim = -1)
-
-def matrix_diag(t):
-    device = t.device
-    i, j = t.shape[-2:]
-    num_diag_el = min(i, j)
-    i_range = torch.arange(i, device = device)
-    j_range = torch.arange(j, device = device)
-    diag_mask = rearrange(i_range, 'i -> i 1') == rearrange(j_range, 'j -> 1 j')
-    diag_el = t.masked_select(diag_mask)
-    return rearrange(diag_el, '(b d) -> b d', d = num_diag_el)
-
-# 2d sinusoidal positional embedding
-# simple vit paper shows it is good enough compared to learned
 
 def posemb_sincos_2d(patches, temperature = 10000, dtype = torch.float32):
+    #*patches.shape는 patches의 shape을 unpacking
+    #h, w, dim, device, dtype에 각각 unpacking
     _, h, w, dim, device, dtype = *patches.shape, patches.device, patches.dtype
 
     y, x = torch.meshgrid(torch.arange(h, device = device), torch.arange(w, device = device), indexing = 'ij')
+    #dim이 4의 배수여야 함(x에 대해 sin, cos, y에 대해 sin, cos)
     assert (dim % 4) == 0, 'feature dimension must be multiple of 4 for sincos emb'
 
     omega = torch.arange(dim // 4, device = device) / (dim // 4 - 1)
@@ -107,13 +47,14 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         return F.layer_norm(x, x.shape[-1:], default(self.learned_gamma, self.gamma), self.beta)
 
-# feedforward
+
 
 class GEGLU(nn.Module):
     def forward(self, x):
         x, gate = x.chunk(2, dim = -1)
         return F.gelu(gate) * x
 
+#GEGLU를 이용한 FeedForward
 def FeedForward(dim, mult = 4, dropout = 0.):
     dim_hidden = int(dim * mult * 2 / 3)
 
@@ -125,7 +66,6 @@ def FeedForward(dim, mult = 4, dropout = 0.):
         nn.Linear(dim_hidden, dim, bias = False)
     )
 
-# attention
 
 class Attention(nn.Module):
     def __init__(
@@ -167,15 +107,12 @@ class Attention(nn.Module):
         b, n, _, device = *x.shape, x.device
 
         # prenorm
-
         x = self.norm(x)
 
         # project for queries, keys, values
-
         q, k, v = self.to_q(x), *self.to_kv(x).chunk(2, dim = -1)
 
         # split for multi-headed attention
-
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), (q, k, v))
 
         # qk rmsnorm, technique circulating within brain used to stabilize a 22B parameter vision model training
@@ -184,8 +121,7 @@ class Attention(nn.Module):
         q = q * self.q_scale
         k = k * self.k_scale
 
-        # similarities
-
+        # similarities(attention scores)
         sim = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
 
         if exists(rel_pos_bias):
@@ -201,20 +137,17 @@ class Attention(nn.Module):
             sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
 
         # attention
-
         attn = sim.softmax(dim = -1)
         attn = self.attn_dropout(attn)
 
         # aggregate
-
         out = einsum('b h i j, b h j d -> b h i d', attn, v)
 
         # merge heads
-
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
-# transformer
+
 
 class Transformer(nn.Module):
     def __init__(
@@ -244,6 +177,8 @@ class Transformer(nn.Module):
     ):
         layers = []
 
+        # residual 연결을 사용하여 각 layer를 연결
+        # depth만큼 (attention과 feedforward)를 반복
         for attn, ff in self.layers:
             x = attn(x, rel_pos_bias = rel_pos_bias, mask = mask) + x
             x = ff(x) + x
@@ -254,154 +189,37 @@ class Transformer(nn.Module):
 
         return x, torch.stack(layers[:-1])
 
-# contrastive losses
-
-class SoftmaxContrastiveLearning(nn.Module):
+class Audiotransformer(nn.Module):
     def __init__(
-        self,
-        *,
-        layers = 1,
-        decoupled_contrastive_learning = False,
-        init_temp = 10
-    ):
+            self,
+            dim,
+            depth,
+            patch_size = 16,
+            accept_spec = False,
+            accept_spec_time_first = True,
+            spec_n_fft = 128,
+            spec_power = 2,
+            spec_win_length = 24,
+            spec_hop_length = None,
+            spec_pad = 0,
+            spec_center = True,
+            spec_pad_mode = 'reflect',
+            patch_dropout_prob = 0.25,
+            spec_aug_stretch_factor = 0.8,
+            spec_aug_freq_mask = 80,
+            spec_aug_time_mask = 80,
+            dim_head = 64,
+            heads = 8,
+            attn_dropout = 0.,
+            ff_mult = 4,
+            ff_dropout = 0.
+        ):
         super().__init__()
-        self.temperatures = nn.Parameter(torch.ones(layers, 1, 1) * math.log(init_temp))
-        self.decoupled_contrastive_learning = decoupled_contrastive_learning
-
-        self.all_gather = AllGather(dim = 2)
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
-
-    def forward(self, audio_latents, text_latents):
-        if audio_latents.ndim == 2:
-            audio_latents = rearrange(audio_latents, '... -> 1 ...')
-
-        if text_latents.ndim == 2:
-            text_latents = rearrange(text_latents, '... -> 1 ...')
-
-        batch = audio_latents.shape[1]
-
-        if self.all_gather.is_distributed:
-            latents = torch.stack((audio_latents, text_latents))
-            latents, _ = self.all_gather(latents)
-            audio_latents, text_latents = latents
-
-        sims = einsum('l i d, l j d -> l i j', audio_latents, text_latents)
-
-        sims = sims * self.temperatures.exp()
-
-        cosine_sims_exp = sims.exp()
-
-        numerator = matrix_diag(cosine_sims_exp)
-
-        if self.decoupled_contrastive_learning:
-            eye = torch.eye(batch, device = self.device, dtype = torch.bool)
-            cosine_sims_exp = cosine_sims_exp.masked_fill(eye, 0.)
-
-        denominator_i = reduce(cosine_sims_exp, 'l i j -> l i', 'sum')
-        denominator_j = reduce(cosine_sims_exp, 'l i j -> l j', 'sum')
-
-        contrastive_loss = -log(numerator) + 0.5 * (log(denominator_i) + log(denominator_j))
-
-        contrastive_loss = reduce(contrastive_loss, 'l n -> l', 'mean')
-        return contrastive_loss.sum()
-
-class SigmoidContrastiveLearning(nn.Module):
-    """ https://arxiv.org/abs/2303.15343 """
-
-    def __init__(
-        self,
-        *,
-        layers = 1,
-        init_temp = 10,
-        init_bias = -10
-    ):
-        super().__init__()
-        self.temperatures = nn.Parameter(torch.ones(layers, 1, 1) * math.log(init_temp))
-        self.bias = nn.Parameter(torch.ones(layers, 1, 1) * init_bias)
-
-        self.all_gather = AllGather(dim = 1, all_reduce_grads = True)
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
-
-    def forward(self, audio_latents, text_latents):
-        device = self.device
-
-        if audio_latents.ndim == 2:
-            audio_latents = rearrange(audio_latents, '... -> 1 ...')
-
-        if text_latents.ndim == 2:
-            text_latents = rearrange(text_latents, '... -> 1 ...')
-
-        text_latents, rank_sizes = self.all_gather(text_latents)
-
-        n = text_latents.shape[1]
-
-        sims = einsum('l i d, l j d -> l i j', audio_latents, text_latents)
-
-        sims = sims * self.temperatures.exp() + self.bias
-
-        labels = torch.eye(n, device = device)
-
-        if exists(rank_sizes):
-            labels_by_ranks = labels.split(rank_sizes.tolist(), dim = 0)
-            labels = labels_by_ranks[dist.get_rank()]
-
-        labels = 2 * rearrange(labels, 'i j -> 1 i j') - torch.ones_like(sims)
-
-        return -F.logsigmoid(labels * sims).sum() / n
-
-# Audio Spectrogram Transformer - https://arxiv.org/abs/2104.01778
-
-def pair(t):
-    return (t, t) if not isinstance(t, tuple) else t
-
-class AudioSpectrogramTransformer(nn.Module):
-    def __init__(
-        self,
-        dim,
-        depth,
-        patch_size = 16,
-        dim_head = 64,
-        heads = 8,
-        attn_dropout = 0.,
-        ff_mult = 4,
-        ff_dropout = 0.,
-        accept_spec = False,
-        accept_spec_time_first = True,
-        spec_n_fft = 128,
-        spec_power = 2,
-        spec_win_length = 24,
-        spec_hop_length = None,
-        spec_pad = 0,
-        spec_center = True,
-        spec_pad_mode = 'reflect',
-        spec_aug_stretch_factor = 0.8,
-        spec_aug_freq_mask = 80,
-        spec_aug_time_mask = 80,
-        patch_dropout_prob = 0.25
-    ):
-        super().__init__()
+        self.patch_size = pair(patch_size)
         self.dim = dim
         self.depth = depth
 
-        self.patch_size = pair(patch_size)
-        patch_input_dim = self.patch_size[0] * self.patch_size[1]
-
-        self.to_patch_tokens = Sequential(
-            Rearrange('b (h p1) (w p2) -> b h w (p1 p2)', p1 = self.patch_size[0], p2 = self.patch_size[1]),
-            nn.LayerNorm(patch_input_dim),
-            nn.Linear(patch_input_dim, dim),
-            nn.LayerNorm(dim)
-        )
-
-        self.accept_spec = accept_spec
-        self.accept_spec_time_first = accept_spec_time_first
-
+        #spectogram 라이브러리 사용
         self.spec = Spectrogram(
             n_fft = spec_n_fft,
             power = spec_power,
@@ -411,13 +229,41 @@ class AudioSpectrogramTransformer(nn.Module):
             center = spec_center,
             pad_mode = spec_pad_mode
         )
+        
+        patch_input_dim = self.patch_size[0] * self.patch_size[1]
 
-        # SpecAugment - seems to be widely used in audio field https://arxiv.org/abs/1904.08779
 
+        #이미지가 32 x 32이고 patch size가 16이면 2x2 크기의 patch로 변환 후 
+        # 각 patch 는 flatten되고 linear layer 적용
+        self.to_patch_tokens = Sequential(
+            Rearrange('b (h p1) (w p2) -> b h w (p1 p2)', p1 = self.patch_size[0], p2 = self.patch_size[1]),
+            nn.LayerNorm(patch_input_dim),
+            nn.Linear(patch_input_dim, dim),
+            nn.LayerNorm(dim)
+        )
+
+        #다양한 augmentation을 위한 라이브러리 사용
+        #TimeStretch는 스펙토그램 시간 축 늘리거나 줄임
+        #FrequencyMasking은 스펙토그램 주파수 축 마스킹
+        #TimeMasking은 스펙토그램 시간 축 마스킹
         self.aug = torch.nn.Sequential(
             TimeStretch(spec_aug_stretch_factor, fixed_rate = True),
             FrequencyMasking(freq_mask_param = spec_aug_freq_mask),
             TimeMasking(time_mask_param = spec_aug_time_mask),
+        )
+
+        self.accept_spec = accept_spec
+        self.accept_spec_time_first = accept_spec_time_first
+
+        #동적 위치 편향을 위한 모듈 정의
+        mlp_hidden_dim = dim // 4
+        self.dynamic_pos_bias_mlp = nn.Sequential(
+            nn.Linear(2, mlp_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_hidden_dim, heads),
+            Rearrange('... i j h -> ... h i j')
         )
 
         self.transformer = Transformer(
@@ -429,86 +275,80 @@ class AudioSpectrogramTransformer(nn.Module):
             ff_mult = ff_mult,
             ff_dropout = ff_dropout
         )
+        
 
-        self.norm = LayerNorm(dim)
-
-        # patch dropout
-
-        self.patch_dropout_prob = patch_dropout_prob
-
-        # 2d dynamic positional bias
-
-        mlp_hidden_dim = dim // 4
-
-        self.dynamic_pos_bias_mlp = nn.Sequential(
-            nn.Linear(2, mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(mlp_hidden_dim, mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(mlp_hidden_dim, heads),
-            Rearrange('... i j h -> ... h i j')
-        )
-
-    def forward(
-        self,
-        x,
-        force_no_patch_dropout = False,
-        return_all_layers = False
-    ):
+    def forward(self, x, force_no_patch_dropout = False, return_all_layers = False):
         batch, device = x.shape[0], x.device
+
+        #x가 2차원이면 Raw waveform, 3차원이면 이미 Spectrogram
+
+        #x의 차원이 3차원이면 accept_spec이 True여야 함
+        #x의 차원이 2차원이면 accept_spec이 False여야 함
         assert (self.accept_spec and x.ndim == 3) or (not self.accept_spec and x.ndim == 2)
 
+        #accpet_spec이 True이면 x의 차원을 변환
         if self.accept_spec and self.accept_spec_time_first:
             x = rearrange(x, 'b t f -> b f t')
-
+        #accpet_spec이 False이면 spec을 계산
         if not self.accept_spec:
             x = self.spec(x)
 
+        if self.accept_spec and self.accept_spec_time_first:
+            x = rearrange(x, 'b f t -> b t f')
+        
         if self.training:
             x = self.aug(x)
 
-        # automatically crop if audio does not yield a 2d spectrogram that is divisible by patch sizes
+        self.patch_dropout_prob = patch_dropout_prob
+        
+        
+        
 
-        height, width = x.shape[-2:]
-        patch_height, patch_width = self.patch_size
+        #Patch 연산 하도록 자동으로 크롭 
+        height, width = x.shape[-2]
+        patch_hegith, patch_width = self.patch_size
 
+        #height, width를 patch size로 나눈 후 가장 가까운 정수로 내림
         rounded_height, rounded_width = map(lambda args: round_down_nearest_multiple(*args), ((height, patch_height), (width, patch_width)))
 
         if (height, width) != (rounded_height, rounded_width): # just keep printing to be annoying until it is fixed
             print_once(f'spectrogram yielded shape of {(height, width)}, but had to be cropped to {(rounded_height, rounded_width)} to be patchified for transformer')
 
+        #패치 사용
         x = x[..., :rounded_height, :rounded_width]
 
-        # to patches
-
+        # 패치 토큰으로 변환
         x = self.to_patch_tokens(x)
 
-        # get number of patches along height and width
-
+        #패치 개수 계산
         _, num_patch_height, num_patch_width, _ = x.shape
 
-        # get 2d relative positions
-
+        #패치의 위치 정보를 포함한 grid 생성
         grid = torch.stack(torch.meshgrid(
             torch.arange(num_patch_height, device = device),
             torch.arange(num_patch_width, device = device)
         , indexing = 'ij'), dim = -1)
 
+        #각 패치 좌표를 한줄로 나열된 벡터로 변환
         grid = rearrange(grid, '... c -> (...) c')
 
-        # 2d sinusoidal positional embedding
-
+        #위치 정보 추가
         x = x + posemb_sincos_2d(x)
 
         x = rearrange(x, 'b ... c -> b (...) c')
+        
 
-        # patch dropout
-
+        #patch dropout
+        #force_no_patch_dropout이면 patch dropout을 하지 않음
         if self.training and self.patch_dropout_prob > 0. and not force_no_patch_dropout:
+            #n은 패치 개수
             n, device = x.shape[1], x.device
 
+
             batch_indices = torch.arange(batch, device = device)
-            batch_indices = rearrange(batch_indices, '... -> ... 1')
+            batch_indices = rearrange(batch_indices, '... -> ... 1') # 1차원 추가
+
+            #유지할 패치 인덱스 선택
             num_patches_keep = max(1, int(n * (1 - self.patch_dropout_prob)))
             patch_indices_keep = torch.randn(batch, n, device = device).topk(num_patches_keep, dim = -1).indices
 
@@ -516,18 +356,15 @@ class AudioSpectrogramTransformer(nn.Module):
 
             grid = repeat(grid, '... -> b ...', b = batch)
             grid = grid[batch_indices, patch_indices_keep]
-
-        # 2d relative positional bias
-
+        
+        #patch 위치 정보를 이용한 relative position bias 계산
         rel_dist = rearrange(grid, '... i c -> ... i 1 c') - rearrange(grid, '... j c -> ... 1 j c')
         rel_pos_bias = self.dynamic_pos_bias_mlp(rel_dist.float())
 
-        # attention, what else
-
+        #Attention 계산산
         x, all_layers = self.transformer(x, rel_pos_bias = rel_pos_bias, return_all_layers = True)
 
-        # final global average and norm (most recent papers show this is superior to CLS token)
-
+        #글로벌 평균 풀링 (ViT에서 CLS 토큰 사용 없이 사용)
         x = reduce(x, 'b n d -> b d', 'mean')
 
         out = self.norm(x)
@@ -536,16 +373,3 @@ class AudioSpectrogramTransformer(nn.Module):
             return out
 
         return out, all_layers
-
-'''
-if __name__ == '__main__':
-    audio_transformer = AudioSpectrogramTransformer(
-    dim = 512,
-    depth = 6,
-    heads = 8,
-    dim_head = 64,
-    spec_n_fft = 128,
-    spec_win_length = 24,
-    spec_aug_stretch_factor = 0.8
-)
-'''
