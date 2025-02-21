@@ -537,6 +537,7 @@ class AudioSpectrogramTransformer(nn.Module):
 
         return out, all_layers
 
+'''
 if __name__ == '__main__':
     audio_transformer = AudioSpectrogramTransformer(
     dim = 512,
@@ -547,3 +548,4 @@ if __name__ == '__main__':
     spec_win_length = 24,
     spec_aug_stretch_factor = 0.8
 )
+'''

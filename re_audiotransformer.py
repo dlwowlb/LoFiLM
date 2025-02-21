@@ -189,10 +189,11 @@ class Transformer(nn.Module):
 
         return x, torch.stack(layers[:-1])
 
-class Audiotransformer(nn.module):
+class Audiotransformer(nn.Module):
     def __init__(
             self,
             dim,
+            depth,
             patch_size = 16,
             accept_spec = False,
             accept_spec_time_first = True,
@@ -207,7 +208,6 @@ class Audiotransformer(nn.module):
             spec_aug_stretch_factor = 0.8,
             spec_aug_freq_mask = 80,
             spec_aug_time_mask = 80,
-            depth,
             dim_head = 64,
             heads = 8,
             attn_dropout = 0.,
