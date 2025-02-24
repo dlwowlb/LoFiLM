@@ -1,6 +1,6 @@
 from Transformer import AudioTransformer, TextTransformer
 from Transformer.AudioTransformer import l2norm
-from allgather import Allgather
+from Distributed import AllGather
 
 
 import math
@@ -92,28 +92,37 @@ class SigmoidContrastiveLearning(nn.Module):
     def forward(self, audio_latents, text_latents):
         device = self.device
 
+        #layer차원 추가
         if audio_latents.ndim == 2:
             audio_latents = rearrange(audio_latents, '... -> 1 ...')
-
         if text_latents.ndim == 2:
             text_latents = rearrange(text_latents, '... -> 1 ...')
 
+        #분산 학습(DDP) 시, 모든 프로세스(rank)의 텍스트 임베딩을 **가로 방향(batch 차원)**으로 모아줌
         text_latents, rank_sizes = self.all_gather(text_latents)
 
         n = text_latents.shape[1]
 
+        #(layers, batch, dim) × (layers, n, dim) → (layers, batch, n)
+        # 레이어별로 모든 오디오 vs 모든 텍스트 쌍에 대한 dot product를 구합니다.
         sims = einsum('l i d, l j d -> l i j', audio_latents, text_latents)
 
+        #위에서 구한 유사도에 온도 곱(온도는 위에서 log를 취해주었기 때문에 exp를 취해줌)
+        #온도(temp)가 커지면 유사도 값의 범위가 확대되어 학습 신호가 강해질 수 있습니다. bias는 일종의 기준점 역할.
         sims = sims * self.temperatures.exp() + self.bias
+
 
         labels = torch.eye(n, device = device)
 
+        #DDP 환경에서 각 rank는 자기 배치에 해당하는 라벨만 필요하므로, labels.split(...) 후 현재 rank에 맞는 부분을 취함.
         if exists(rank_sizes):
             labels_by_ranks = labels.split(rank_sizes.tolist(), dim = 0)
             labels = labels_by_ranks[dist.get_rank()]
 
+        #[0, 1]로 표현된 라벨을 **[-1, +1]**로 변환. 이는 BCEWithLogitsLoss를 사용하기 위함.
         labels = 2 * rearrange(labels, 'i j -> 1 i j') - torch.ones_like(sims)
 
+        #labels * sims가 양성(1)에서는 큰 양수, 음성(-1)에서는 큰 음수가 되도록 학습.
         return -F.logsigmoid(labels * sims).sum() / n
 
 class MuLaN(nn.Module):
@@ -140,6 +149,8 @@ class MuLaN(nn.Module):
 
         # sigmoid_contrastive_loss가 True일 경우 SigmoidContrastiveLearning을 사용하고, 
         # 아닐 경우 SoftmaxContrastiveLearning을 사용
+        # 여기서 partial은 def some_function():
+                            #return SoftmaxContrastiveLearning(decoupled_contrastive_learning=True)
         klass = SigmoidContrastiveLearning if sigmoid_contrastive_loss else partial(
             SoftmaxContrastiveLearning,
             decoupled_contrastive_learning = decoupled_contrastive_learning
