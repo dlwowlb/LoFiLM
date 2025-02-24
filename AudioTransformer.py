@@ -1,9 +1,12 @@
 from einops import rearrange, repeat, reduce
 import torch
-import torch.nn as nn
+import torch.nn as nn 
 import torch.nn.functional as F
 
+from torch import nn, einsum
+
 from torchaudio.transforms import Spectrogram, TimeStretch, FrequencyMasking, TimeMasking
+from einops.layers.torch import Rearrange
 
 #patch size가 16이면 16x16 크기의 patch로
 def pair(t):
@@ -13,6 +16,17 @@ def pair(t):
 def round_down_nearest_multiple(n, divisor):
     return n // divisor * divisor
 
+def default(val, d):
+    return val if exists(val) else d
+def exists(val):
+    return val is not None
+
+def l2norm(t):
+    return F.normalize(t, p = 2, dim = -1)
+
+#모듈이 존재하는지 확인(None이 아닌 함수만 쌓기기)
+def Sequential(*modules):
+    return nn.Sequential(*filter(exists, modules))
 
 def posemb_sincos_2d(patches, temperature = 10000, dtype = torch.float32):
     #*patches.shape는 patches의 shape을 unpacking
