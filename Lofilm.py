@@ -15,6 +15,8 @@ from einops import rearrange, repeat, reduce
 from beartype.typing import List, Optional, Tuple
 from beartype import beartype
 
+from vector_quantize_pytorch import ResidualVQ
+
 
 #전체 레이어 중 일부 레이어만 고르게 선택할 수 있도록 인덱스를 가져오는 함수
 #layers: 선택할 레이어 수, total_layers: 전체 레이어 수
@@ -346,3 +348,90 @@ class MuLaN(nn.Module):
         #레이어별로 계산된 Contrastive Loss와 전체 Contrastive Loss를 합침
         #최종 레이어 표현과 중간 레이어들에서 골고루 골라서 학습
         return cl_loss + hierarchical_cl_loss
+    
+#semantic, coarse, fine quantization
+class MuLaNEmbedQuantizer(AudioConditionerBase):
+    @beartype
+    def __init__(
+        self,
+        mulan: MuLaN,
+        conditioning_dims: Tuple[int, ...],
+        rq_num_quantizers = 8,
+        rq_ema_decay = 0.9,
+        codebook_size = 1024,
+        namespaces: Tuple[str, ...] = ('semantic', 'coarse', 'fine'),
+
+    ):
+        super().__init__()
+        self.mulan = mulan
+        assert len(namespaces) > 0
+        
+        self.namespaces = namespaces
+        self.conditioning_dims = conditioning_dims
+
+        assert len(conditioning_dims) == len(namespaces), 'number of conditioning dimensions must be equal to number of namespaces'
+
+        dim = mulan.dim_latent
+
+        self.rq = ResidualVQ(
+            dim = dim,
+            num_quantizers = rq_num_quantizers,
+            codebook_size = codebook_size,
+            decay = rq_ema_decay,
+            commitment_weight = 0,    # only use EMA to update codebooks
+            kmeans_init = True,
+            threshold_ema_dead_code = 2,
+            quantize_dropout = False  # no quantize dropout
+        )
+
+        self.dim = dim
+        self.num_codebooks = rq_num_quantizers
+
+        self.cond_embeddings = nn.ParameterDict({})
+
+        for namespace, conditioning_dim in zip(namespaces, conditioning_dims):
+            cond_embeddings = nn.Parameter(torch.randn(rq_num_quantizers, codebook_size, conditioning_dim))
+            nn.init.normal_(cond_embeddings, std = 0.02)
+
+            self.cond_embeddings[namespace] = cond_embeddings
+
+        self.set_default_namespace(namespaces[0])
+
+    def parameters(self):
+        return self.cond_embeddings.parameters()
+
+    def set_default_namespace(self, namespace):
+        self._default_namespace = namespace
+
+    def forward(self,wavs = None,texts = None,namespace = None):
+        #오디오나 텍스트 중 하나만 존재해야 함
+        assert exists(wavs) ^ exists(texts)
+
+        #namespace가 없으면 default namespace 사용
+        #namespace가 존재하지 않으면 에러 발생
+        namespace = default(namespace, self._default_namespace)
+        assert namespace in self.namespaces, f'namespace {namespace} not found'
+        
+
+        cond_embeddings = self.cond_embeddings[namespace]
+
+        with torch.no_grad():
+            self.mulan.eval()
+
+            # sound and language live in joint embedding space because of contrastive learning
+
+            if exists(wavs):
+                latents = self.mulan.get_audio_latents(wavs)
+            elif exists(texts):
+                latents = self.mulan.get_text_latents(texts)
+
+        #양자화 수행해서 인덱스만 가져옴
+        _, indices, _ = self.rq(latents)
+
+        batch, num_codebooks, dim = indices.shape[0], self.num_codebooks, cond_embeddings.shape[-1]
+
+        cond_embeddings = repeat(cond_embeddings, 'q c d -> b q c d', b = batch)
+        indices = repeat(indices, 'b q -> b q 1 d', q = num_codebooks, d = dim)
+
+        cond_embeddings = cond_embeddings.gather(2, indices)
+        return rearrange(cond_embeddings, 'b q 1 d -> b q d')
