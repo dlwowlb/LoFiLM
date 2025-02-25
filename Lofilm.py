@@ -1,5 +1,5 @@
 from Transformer import AudioTransformer, TextTransformer
-from Transformer.AudioTransformer import l2norm
+from Transformer.AudioTransformer import l2norm, default, LayerNorm
 from Distributed import AllGather
 
 
@@ -15,8 +15,14 @@ from einops import rearrange, repeat, reduce
 from beartype.typing import List, Optional, Tuple
 from beartype import beartype
 
+def interspersed_indices(layers, total_layers):
+    assert total_layers >= layers
+    step = total_layers / layers
+    return (torch.arange(0, layers) * step).floor().long()
 
 
+#CLIP 모델의 InfoNCE Loss와 유사(양성 샘플 유사도 높이고, 음성 샘플 유사도 낮추는 방향으로 학습)
+#오디오와 텍스트 간 유사도를 계산
 class SoftmaxContrastiveLearning(nn.Module):
     def __init__(
         self,
@@ -28,7 +34,7 @@ class SoftmaxContrastiveLearning(nn.Module):
         super().__init__()
         self.temperatures = nn.Parameter(torch.ones(layers, 1, 1) * math.log(init_temp))
         self.decoupled_contrastive_learning = decoupled_contrastive_learning
-
+        #분산학습시 AllGather 사용
         self.all_gather = AllGather(dim = 2)
 
     @property
@@ -36,38 +42,97 @@ class SoftmaxContrastiveLearning(nn.Module):
         return next(self.parameters()).device
 
     def forward(self, audio_latents, text_latents):
-        if audio_latents.ndim == 2:
+        # 임베딩이 (batch, dim)이면 (1, batch, dim)으로 차원 추가
+        if audio_latents.ndim == 2: 
             audio_latents = rearrange(audio_latents, '... -> 1 ...')
-
         if text_latents.ndim == 2:
             text_latents = rearrange(text_latents, '... -> 1 ...')
 
+        #배치 크기 가져오기기
         batch = audio_latents.shape[1]
 
+        #분산 환경에서 모든 프로세스(rank)의 텍스트 임베딩을 **가로 방향(batch 차원)**으로 모아줌
         if self.all_gather.is_distributed:
             latents = torch.stack((audio_latents, text_latents))
             latents, _ = self.all_gather(latents)
-            audio_latents, text_latents = latents
+            audio_latents, text_latents = latents #shape는 (layers, batch, dim)이 됨
 
+        #레이어별로 모든 오디오 vs 모든 텍스트 쌍에 대한 dot product를 구합니다.
         sims = einsum('l i d, l j d -> l i j', audio_latents, text_latents)
 
+        #온도 파라미터가 크면 유사도 차이가 더 크게 반영되어 분포가 sharp해진다.
+        #위에서 log를 취해주었기 때문에 exp를 취해줌
         sims = sims * self.temperatures.exp()
 
+        #소프트맥스를 취해주어 유사도를 확률로 변환
         cosine_sims_exp = sims.exp()
 
+        #대각 성분만 가져옴(양성 항)(e.g. (audio1, text1), (audio2, text2), ...)
         numerator = matrix_diag(cosine_sims_exp)
 
+        #loss 함수에서 양성 음성 분리
+        #대각 성분을 0으로 만들어줌(불리언 마스크로)
+        #대각선(양성 위치)를 0으로 만들어서, loss function에서 분모 계산시 양성 항이 제외되도록
+        #더욱 안정적 학습 가능
         if self.decoupled_contrastive_learning:
             eye = torch.eye(batch, device = self.device, dtype = torch.bool)
             cosine_sims_exp = cosine_sims_exp.masked_fill(eye, 0.)
-
+        #오디오 i에 대해 모든 텍스트 j에 대한 유사도 합
+        #텍스트 j에 대한 모든 오디오 i에 대한 유사도 합
         denominator_i = reduce(cosine_sims_exp, 'l i j -> l i', 'sum')
         denominator_j = reduce(cosine_sims_exp, 'l i j -> l j', 'sum')
 
+        #최종적으로 Contrastive Loss 계산
+        #양성 항은 -log 취해주고, 음성 항은 log 취하고 0.5를 곱해줌(양성, 음성 항이 모두 고려하기 위함)
         contrastive_loss = -log(numerator) + 0.5 * (log(denominator_i) + log(denominator_j))
 
+        #배치 차원에 대해 평균 취함(각 레이어별로 배치 평균 로스)
         contrastive_loss = reduce(contrastive_loss, 'l n -> l', 'mean')
-        return contrastive_loss.sum()
+        return contrastive_loss.sum() #최종적으로 레이버 차원을 전부 합산(단일 스칼라 로스)
+
+
+class MultiLayerContrastiveLoss(nn.Module):
+    def __init__(
+        self,
+        *,
+        audio_dim,
+        text_dim,
+        dim_latent,
+        layers,
+        decoupled_contrastive_learning = False,
+        sigmoid_contrastive_loss = False
+    ):
+        super().__init__()
+        self.layers = layers
+
+        self.audio_norm = LayerNorm(audio_dim, scale = False)
+        self.audio_gamma = nn.Parameter(torch.ones(layers, 1, audio_dim))
+        self.audio_latent_weight = nn.Parameter(torch.randn(layers, audio_dim, dim_latent))
+        self.audio_latent_bias = nn.Parameter(torch.randn(layers, 1, dim_latent))
+
+        self.text_norm = LayerNorm(text_dim, scale = False)
+        self.text_gamma = nn.Parameter(torch.ones(layers, 1, text_dim))
+        self.text_latent_weight = nn.Parameter(torch.randn(layers, text_dim, dim_latent))
+        self.text_latent_bias = nn.Parameter(torch.randn(layers, 1, dim_latent))
+
+        klass = SigmoidContrastiveLearning if sigmoid_contrastive_loss else partial(SoftmaxContrastiveLearning, decoupled_contrastive_learning = decoupled_contrastive_learning)
+        self.contrast = klass(layers = layers)
+
+    def forward(self, *, audio_layers, text_layers):
+        device, batch = audio_layers.device, audio_layers.shape[1]
+
+        audio_gap = reduce(audio_layers, 'l b n d -> l b d', 'mean')
+        audio_embeds = self.audio_norm(audio_gap) * self.audio_gamma
+        audio_latents = einsum('l b d, l d e -> l b e', audio_embeds, self.audio_latent_weight) + self.audio_latent_bias
+        audio_latents = l2norm(audio_latents)
+
+        text_cls_tokens = text_layers[:, :, 0]
+        text_embeds = self.text_norm(text_cls_tokens) * self.text_gamma
+        text_latents = einsum('l b d, l d e -> l b e', text_embeds, self.text_latent_weight) + self.text_latent_bias
+        text_latents = l2norm(text_latents)
+
+        return self.contrast(audio_latents, text_latents)
+
 
 #Contrastive Learning을 sigmoid + 로지스틱 로스 방식
 class SigmoidContrastiveLearning(nn.Module):
@@ -157,6 +222,7 @@ class MuLaN(nn.Module):
         )
         self.contrast = klass()
 
+        #
         self.multi_layer_contrastive_learning = None
 
         if hierarchical_contrastive_loss:
@@ -225,7 +291,7 @@ class MuLaN(nn.Module):
 
         #오디오 임베딩과 텍스트 임베딩의 dot product 계산(유사도 구하기)
         #einsum('i d, i d -> i')는 (batch, dim) × (batch, dim) → (batch,) 형태로
-        #샘플별 유사도 계산산
+        #샘플별 유사도 계산
         if return_similarities:
             return einsum('i d, i d -> i', audio_latents, text_latents)
 
