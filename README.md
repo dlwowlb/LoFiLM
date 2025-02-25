@@ -7,7 +7,7 @@ Todo
 - [x]  AudioTransformer 모듈 만들기
 - [x]  TextTransformer 모듈 만들기
 - [x]  Mulan 모듈로 Audio, Text를 공통된 latent 차원으로 변환
-- [ ]  Text, Audio 두 modality의 임베딩 간의 contrastive loss 모듈 만들기
+- [x]  Text, Audio 두 modality의 임베딩 간의 contrastive loss 모듈 만들기
 - [ ]  Mulan의 출력을 RVQ 코드북으로 quantize
 - [ ]  Audiolm을 사용한 Semantic, Coarse, Fine 조건 임베딩 토큰 생성
 - [ ]  토큰 생성 후 soundstream decoder로 여러 음악 샘플 생성 및 MuLaN으로 selecting
