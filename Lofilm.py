@@ -15,6 +15,9 @@ from einops import rearrange, repeat, reduce
 from beartype.typing import List, Optional, Tuple
 from beartype import beartype
 
+
+#전체 레이어 중 일부 레이어만 고르게 선택할 수 있도록 인덱스를 가져오는 함수
+#layers: 선택할 레이어 수, total_layers: 전체 레이어 수
 def interspersed_indices(layers, total_layers):
     assert total_layers >= layers
     step = total_layers / layers
@@ -90,7 +93,7 @@ class SoftmaxContrastiveLearning(nn.Module):
         contrastive_loss = reduce(contrastive_loss, 'l n -> l', 'mean')
         return contrastive_loss.sum() #최종적으로 레이버 차원을 전부 합산(단일 스칼라 로스)
 
-
+#레이어별로 임베딩을 가져와서 Contrastive Loss 계산
 class MultiLayerContrastiveLoss(nn.Module):
     def __init__(
         self,
@@ -105,32 +108,49 @@ class MultiLayerContrastiveLoss(nn.Module):
         super().__init__()
         self.layers = layers
 
+        #LayerNorm에서 scale=False로 설정하여, gamma 파라미터를 사용하지 않음
+        #대신 레이어별로 gamma 파라미터를 사용하기 위해 nn.Parameter로 선언
         self.audio_norm = LayerNorm(audio_dim, scale = False)
         self.audio_gamma = nn.Parameter(torch.ones(layers, 1, audio_dim))
+        
+        #오디오 임베딩 -> latent space로 projection
         self.audio_latent_weight = nn.Parameter(torch.randn(layers, audio_dim, dim_latent))
         self.audio_latent_bias = nn.Parameter(torch.randn(layers, 1, dim_latent))
 
+        #텍스트도 동일
         self.text_norm = LayerNorm(text_dim, scale = False)
         self.text_gamma = nn.Parameter(torch.ones(layers, 1, text_dim))
         self.text_latent_weight = nn.Parameter(torch.randn(layers, text_dim, dim_latent))
         self.text_latent_bias = nn.Parameter(torch.randn(layers, 1, dim_latent))
 
+        #sigmoid_contrastive_loss가 True일 경우 SigmoidContrastiveLearning을 사용하고,
+        #아닐 경우 SoftmaxContrastiveLearning을 사용
         klass = SigmoidContrastiveLearning if sigmoid_contrastive_loss else partial(SoftmaxContrastiveLearning, decoupled_contrastive_learning = decoupled_contrastive_learning)
         self.contrast = klass(layers = layers)
 
     def forward(self, *, audio_layers, text_layers):
         device, batch = audio_layers.device, audio_layers.shape[1]
 
+        #시퀀스 길이로 평균 내어서 (layers, batch, dim)
+        #시퀀스 단위 글로벌 평균 풀링
+        #LayerNorm을 거친다음, 레이어별 스케일 파라미터(audio_gamma)를 곱해줌
         audio_gap = reduce(audio_layers, 'l b n d -> l b d', 'mean')
         audio_embeds = self.audio_norm(audio_gap) * self.audio_gamma
+
+        #(layers, batch, dim) × (layers, dim, dim_latent) → (layers, batch, dim_latent)
+        #레이어(l)별로 따로 곱해짐
         audio_latents = einsum('l b d, l d e -> l b e', audio_embeds, self.audio_latent_weight) + self.audio_latent_bias
         audio_latents = l2norm(audio_latents)
 
+        #텍스트는 CLS 토큰만 사용(BERT)
         text_cls_tokens = text_layers[:, :, 0]
+
+        #나머지는 동일
         text_embeds = self.text_norm(text_cls_tokens) * self.text_gamma
         text_latents = einsum('l b d, l d e -> l b e', text_embeds, self.text_latent_weight) + self.text_latent_bias
         text_latents = l2norm(text_latents)
 
+        #레이어별로 Contrastive Loss 계산
         return self.contrast(audio_latents, text_latents)
 
 
@@ -222,16 +242,23 @@ class MuLaN(nn.Module):
         )
         self.contrast = klass()
 
-        #
+        #레이어별 Contrastive Loss 계산을 위한 MultiLayerContrastiveLoss
         self.multi_layer_contrastive_learning = None
 
+        #Hierarchical Contrastive Loss 사용 시
         if hierarchical_contrastive_loss:
+            # hierarchical_contrastive_loss_layers가 None이 아니면 사용
+            # 아니면 min(audio_transformer.depth, text_transformer.depth) - 1
             num_layers = default(hierarchical_contrastive_loss_layers, min(audio_transformer.depth, text_transformer.depth) - 1)
+            
+            #레이어 수가 0 이하면 에러 발생
             assert num_layers > 0
 
+            #depth가 12, num_layers가 4면 2,5,8,11번째 골고루 선택
             self.register_buffer('text_layers_indices', interspersed_indices(num_layers, text_transformer.depth))
             self.register_buffer('audio_layers_indices', interspersed_indices(num_layers, audio_transformer.depth))
 
+            #멀티 레이어 대조학습 
             self.multi_layer_contrastive_learning = MultiLayerContrastiveLoss(
                 audio_dim = self.audio.dim,
                 text_dim = self.text.dim,
@@ -306,14 +333,16 @@ class MuLaN(nn.Module):
         if not exists(self.multi_layer_contrastive_learning):
             return cl_loss
 
+        #위의 버퍼로부터 가져온 인덱스를 사용하여 레이어별로 Contrastive Loss 계산
         audio_layers = audio_layers[self.audio_layers_indices]
         text_layers = text_layers[self.text_layers_indices]
 
-        # whether to do cl loss across all layers, from ViCHA paper https://arxiv.org/abs/2208.13628
+        #여러 레이어의 임베딩 모두 활용해 대조학습, from ViCHA paper https://arxiv.org/abs/2208.13628
 
         hierarchical_cl_loss = self.multi_layer_contrastive_learning(
             audio_layers = audio_layers,
             text_layers = text_layers
         )
-
+        #레이어별로 계산된 Contrastive Loss와 전체 Contrastive Loss를 합침
+        #최종 레이어 표현과 중간 레이어들에서 골고루 골라서 학습
         return cl_loss + hierarchical_cl_loss

@@ -53,8 +53,12 @@ def posemb_sincos_2d(patches, temperature = 10000, dtype = torch.float32):
 class LayerNorm(nn.Module):
     def __init__(self, dim, scale = True):
         super().__init__()
+
+        #scale이 false이면 gamma를 학습하지 않음
         self.learned_gamma = nn.Parameter(torch.ones(dim)) if scale else None
 
+        #register_buffer는 모델의 상태를 저장하지 않는 텐서를 생성
+        #state_dict에 저장되지 않음
         self.register_buffer('gamma', torch.ones(dim), persistent = False)
         self.register_buffer('beta', torch.zeros(dim), persistent = False)
 
