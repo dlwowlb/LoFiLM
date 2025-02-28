@@ -8,7 +8,7 @@ Todo
 - [x]  TextTransformer 모듈 만들기
 - [x]  Mulan 모듈로 Audio, Text를 공통된 latent 차원으로 변환
 - [x]  Text, Audio 두 modality의 임베딩 간의 contrastive loss 모듈 만들기
-- [ ]  Mulan의 출력을 RVQ 코드북으로 quantize
+- [x]  Mulan의 출력을 RVQ 코드북으로 quantize
 - [ ]  Audiolm을 사용한 Semantic, Coarse, Fine 조건 임베딩 토큰 생성
     - [ ] Semantic Transformer
     - [ ] Coarse Transformer
@@ -22,3 +22,4 @@ Todo
 - [ ]  분산학습 프로세스 다시 이해
 - [ ]  ResidualVQ 모듈 다시 이해(이미 정의되어 있음)
 - [ ]  추상 베이스 클래스의 역할 이해
+- [ ]  X_Clip (BPE 없이) 토크나이저
