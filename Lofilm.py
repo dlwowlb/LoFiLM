@@ -15,7 +15,7 @@ from einops import rearrange, repeat, reduce
 from beartype.typing import List, Optional, Tuple
 from beartype import beartype
 
-from vector_quantize_pytorch import ResidualVQ
+from vector_quantize_pytorch import ResidualVQ 
 
 
 #전체 레이어 중 일부 레이어만 고르게 선택할 수 있도록 인덱스를 가져오는 함수
@@ -348,6 +348,10 @@ class MuLaN(nn.Module):
         #레이어별로 계산된 Contrastive Loss와 전체 Contrastive Loss를 합침
         #최종 레이어 표현과 중간 레이어들에서 골고루 골라서 학습
         return cl_loss + hierarchical_cl_loss
+
+
+class AudioConditionerBase(nn.Module):
+    pass
     
 #semantic, coarse, fine quantization
 class MuLaNEmbedQuantizer(AudioConditionerBase):
@@ -373,6 +377,9 @@ class MuLaNEmbedQuantizer(AudioConditionerBase):
 
         dim = mulan.dim_latent
 
+
+        #이미 정의된 코드북 코드 사용
+        #Residual VQ는 한번에 양자화하는 대신 여러 단계로 나눠서 양자화
         self.rq = ResidualVQ(
             dim = dim,
             num_quantizers = rq_num_quantizers,
@@ -387,6 +394,7 @@ class MuLaNEmbedQuantizer(AudioConditionerBase):
         self.dim = dim
         self.num_codebooks = rq_num_quantizers
 
+        #딕셔너리 초기화해서 저장
         self.cond_embeddings = nn.ParameterDict({})
 
         for namespace, conditioning_dim in zip(namespaces, conditioning_dims):
@@ -412,7 +420,7 @@ class MuLaNEmbedQuantizer(AudioConditionerBase):
         namespace = default(namespace, self._default_namespace)
         assert namespace in self.namespaces, f'namespace {namespace} not found'
         
-
+        #코드워드(실제 코드북 벡터)
         cond_embeddings = self.cond_embeddings[namespace]
 
         with torch.no_grad():
@@ -426,7 +434,7 @@ class MuLaNEmbedQuantizer(AudioConditionerBase):
                 latents = self.mulan.get_text_latents(texts)
 
         #양자화 수행해서 인덱스만 가져옴
-        _, indices, _ = self.rq(latents)
+        _, indices, _ = self.rq(latents) #latent를 이미 정의된 양자화 기법으로 이산화
 
         batch, num_codebooks, dim = indices.shape[0], self.num_codebooks, cond_embeddings.shape[-1]
 
