@@ -349,7 +349,7 @@ class MuLaN(nn.Module):
         #최종 레이어 표현과 중간 레이어들에서 골고루 골라서 학습
         return cl_loss + hierarchical_cl_loss
 
-
+#추상 베이스 클래스
 class AudioConditionerBase(nn.Module):
     pass
     
