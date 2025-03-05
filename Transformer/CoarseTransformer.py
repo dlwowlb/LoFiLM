@@ -1,4 +1,5 @@
 from torch import nn
+from audiolm_pytorch.t5 import t5_encode_text, get_encoded_dim, DEFAULT_T5_NAME
 
 
 class CoarseTransformer(nn.Module):
@@ -147,14 +148,23 @@ class CoarseTransformer(nn.Module):
         kv_cache = None,
         embed_cache = None
     ):
-        b, device = semantic_token_ids.shape[0], semantic_token_ids.device
+        #semantic_tokens은 semantic.generate에서 생성됨
+        #semantic은 semanticTransformerWrapper에서 생성됨
+
+        #semantic token의 코드북에서 인덱스 가져옴옴
+        b, device = semantic_token_ids.shape[0], semantic_token_ids.device 
+        
+        #arange 함수 쓸 때 device로 옮김김
         arange = partial(torch.arange, device = device)
 
+        #text가 존재하거나 text_embeds가 존재해야 함
         has_text = exists(text) or exists(text_embeds)
         assert not (self.has_condition ^ has_text)
 
+        #text_embeds가 존재하지 않고 text가 존재하면
         if not exists(text_embeds) and exists(text):
-            with torch.inference_mode():
+            #text를 토큰 임베딩으로 변환
+            with torch.inference_mode(): #torch.no_grad보다 더 최적화
                 text_embeds = self.embed_text(text, output_device = device)
 
         text_mask = None

@@ -1,6 +1,8 @@
-from utils import t5_encode_text, get_encoded_dim, DEFAULT_T5_NAME, default, prob_mask_like
+from utils import *
 from einops import rearrange, repeat, reduce
 from einops.layers.torch import Rearrange
+
+import torch.nn.functional as F
 
 
 class SemanticTransformer(nn.Module):
@@ -62,6 +64,7 @@ class SemanticTransformer(nn.Module):
             **kwargs
         )
 
+        #토큰 추가해서 로짓 생성
         self.to_logits = nn.Linear(dim, num_semantic_tokens + 1)
 
     @property
@@ -152,23 +155,34 @@ class SemanticTransformer(nn.Module):
             keep_mask = prob_mask_like((b,), 1 - cond_drop_prob, device = device) #마스크 만들고
             text_mask = rearrange(keep_mask, 'b -> b 1') & text_mask #마스크 적용
 
-
-
-
+        #로스를 반환해야하면 label을 ids로 그대로 활용(teacher forcing 방식)
+        #ids는 마지막 토큰을 제외한 것 -> 다음 토큰을 예측하게 하기 위함
+        #[a,b,c,d]라고 했을때 라벨은 [a,b,c,d] 입력은 [a,b,c] 
+        #[a,b,c]를 입력받으면 d를 예측하도록
         if return_loss:
             labels, ids = ids.clone(), ids[:, :-1]
 
+        #임베딩 벡터로 변환(패딩 포함)
+        #nn.embedding이고 마스크 위치에 0(혹은 다른 값) 넣기  
         tokens = get_embeds(self.semantic_embedding, ids)
 
+        #start token은 무작위 값(학습 가능함)
+        #(batch_size, 1, d)로 만들어서 토큰에 추가
         start_tokens = repeat(self.start_token, 'd -> b 1 d', b = ids.shape[0])
 
+        #start token을 토큰에 추가(시퀀스 차원으로)
         tokens = torch.cat((start_tokens, tokens), dim = 1)
 
+        #마스크가 있으면 좌측에 1 우측에 0 만큼 True값 패딩 추가
         if exists(self_attn_mask):
             self_attn_mask = F.pad(self_attn_mask, (1, 0), value = True)
 
+        #utils.py에 있는 Transformer 클래스의 forward 함수 호출
+        #key value cache가 있으면 사용
+        #key value cache는 한 토큰씩 생성할 때 이전 토큰들에서 이미 계산된 key, value 재사용용
         tokens, kv_cache = self.transformer(tokens, context = text_embeds, self_attn_mask = self_attn_mask, context_mask = text_mask, kv_cache = kv_cache, return_kv_cache = True)
         logits = self.to_logits(tokens)
+
 
         if not return_kv_cache:
             return logits
