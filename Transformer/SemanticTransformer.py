@@ -312,7 +312,8 @@ class SemanticTransformerWrapper(nn.Module):
     def embed_text(self, text):
         return self.transformer.embed_text(text, output_device = self.device)
 
-    @eval_decorator
+    #시맨틱 토큰 생성
+    @eval_decorator #데코레이터
     @torch.inference_mode()
     @beartype
     def generate(
@@ -340,6 +341,7 @@ class SemanticTransformerWrapper(nn.Module):
         if exists(prime_wave):
             assert not exists(prime_ids)
             assert exists(self.wav2vec)
+            #위에서 정의한 코드북 인덱스 생성
             ids = self.wav2vec(
                 prime_wave,
                 flatten = False,
@@ -350,30 +352,34 @@ class SemanticTransformerWrapper(nn.Module):
         else:
             ids = torch.empty((batch_size, 0), dtype = torch.long, device = device)
 
+        #중복제거 및 패딩 추가
         if self.unique_consecutive:
             ids = batch_unique_consecutive(ids, pad_value = self.pad_id)
 
         # derive joint audio-text embeddings if needed
 
+        #오디오 컨디셔너 존재하고 prime_wave가 존재하면 텍스트와 텍스트 임베딩은 없어야함
         if exists(self.audio_conditioner) and exists(prime_wave):
             assert not exists(text) and not exists(text_embeds)
+            #텍스트, 텍스트 임베딩 없는거 확인했으면 시맨틱 텍스트 임베딩 생성
+            #실제로 생성한건 아닌것처럼 보임, base class 사용 <- 확인 바람
             text_embeds = self.audio_conditioner(wavs = prime_wave, namespace = 'semantic')
 
-        # derive text embeddings if needed
-
+        #텍스트나 텍스트 임베딩이 있으면(has_text가 True이면면) has_condition이 True여야함
         has_text = exists(text) or exists(text_embeds)
         assert not (self.transformer.has_condition ^ has_text)
 
+        #텍스트 임베딩이 없고 텍스트만 있으면 텍스트 임베딩 생성
         if not exists(text_embeds) and exists(text):
             with torch.inference_mode():
                 text_embeds = self.transformer.embed_text(text, output_device = device)
 
         # start length and get running id output
-
         batch = ids.shape[0]
         start_length = ids.shape[-1]
         sample_semantic_ids = ids.clone()
 
+        #시퀸스에서 패딩 토큰이 아닌 토큰의 개수, 유효 토큰의 마지막 인덱스 구함
         last_logit_indices = (ids != self.pad_id).sum(dim = -1).long()
 
         # kv cache
