@@ -23,3 +23,4 @@ Todo
 - [ ]  ResidualVQ 모듈 다시 이해(이미 정의되어 있음)
 - [ ]  추상 베이스 클래스의 역할 이해
 - [ ]  X_Clip (BPE 없이) 토크나이저
+- [ ]  Semantic, Coarse, Fine Transformer의 차이점

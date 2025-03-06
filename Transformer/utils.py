@@ -3,16 +3,47 @@ import transformers
 
 from transformers import T5Tokenizer, T5EncoderModel, T5Config
 from torch import nn, einsum, Tensor
-from einops import rearrange, repeat, reduce
+from einops import rearrange, repeat, reduce, pack, unpack
+from torch.nn.utils.rnn import pad_sequence
+from functools import partial, wraps
 
 from beartype import beartype
 from beartype.typing import Union, List
 
-# less warning messages since only using encoder
+from pathlib import Path
+
+from torchaudio.functional import resample
+
+import warnings
+import logging
+
+import joblib
+import fairseq
+
+
+
+def noop(*args, **kwargs):
+    pass
 
 transformers.logging.set_verbosity_error()
+logging.root.setLevel(logging.ERROR)
+warnings.warn = noop
 
-# helper functions
+def always(val):
+    def inner(*args, **kwargs):
+        return val
+    return inner
+
+def maybe(fn):
+    if not exists(fn):
+        return always(None)
+
+    @wraps(fn)
+    def inner(x, *args, **kwargs):
+        if not exists(x):
+            return x
+        return fn(x, *args, **kwargs)
+    return inner
 
 def exists(val):
     return val is not None
@@ -307,3 +338,144 @@ class Transformer(nn.Module):
             return x
 
         return x, torch.stack(new_kv_cache)
+
+
+def round_down_nearest_multiple(num, divisor):
+    return num // divisor * divisor
+
+def curtail_to_multiple(t, mult, from_left = False):
+    data_len = t.shape[-1]
+    rounded_seq_len = round_down_nearest_multiple(data_len, mult)
+    seq_slice = slice(None, rounded_seq_len) if not from_left else slice(-rounded_seq_len, None)
+    return t[..., seq_slice]
+
+def exists(val):
+    return val is not None
+
+
+
+# helper functions
+
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
+
+#사전학습된 휴버트 모델 불러와서 kmeans와 함께 사용용
+class HubertWithKmeans(nn.Module):
+    """
+    checkpoint and kmeans can be downloaded at https://github.com/facebookresearch/fairseq/tree/main/examples/hubert
+    or you can train your own
+    """
+
+    def __init__(
+        self,
+        checkpoint_path,
+        kmeans_path,
+        target_sample_hz = 16000,
+        seq_len_multiple_of = None,
+        output_layer = 9
+    ):
+        super().__init__()
+
+        self.target_sample_hz = target_sample_hz
+        self.seq_len_multiple_of = seq_len_multiple_of
+        self.output_layer = output_layer
+
+        model_path = Path(checkpoint_path)
+        kmeans_path = Path(kmeans_path)
+
+        assert model_path.exists(), f'path {checkpoint_path} does not exist'
+        assert kmeans_path.exists(), f'path {kmeans_path} does not exist'
+
+        checkpoint = torch.load(checkpoint_path)
+        load_model_input = {checkpoint_path: checkpoint}
+
+        #사전학습된 모델 불러오기
+        model, *_ = fairseq.checkpoint_utils.load_model_ensemble_and_task(load_model_input)
+
+        #불러온 모델의 첫번째 모델 선택 후 eval
+        self.model = model[0]
+        self.model.eval()
+
+
+        kmeans = joblib.load(kmeans_path)
+
+        self.kmeans = kmeans
+
+        self.register_buffer(
+            'cluster_centers',
+            torch.from_numpy(kmeans.cluster_centers_)
+        )
+
+    @property
+    def groups(self):
+        return 1
+
+    @property
+    def codebook_size(self):
+        return self.kmeans.n_clusters
+
+    @property
+    def downsample_factor(self):
+        # todo: double check
+        return 320
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        wav_input,
+        flatten = True,
+        input_sample_hz = None
+    ):
+        batch, device = wav_input.shape[0], wav_input.device
+
+        if exists(input_sample_hz):
+            wav_input = resample(wav_input, input_sample_hz, self.target_sample_hz)
+
+        if exists(self.seq_len_multiple_of):
+            wav_input = curtail_to_multiple(wav_input, self.seq_len_multiple_of)
+
+        embed = self.model(
+            wav_input,
+            features_only = True,
+            mask = False,  # thanks to @maitycyrus for noticing that mask is defaulted to True in the fairseq code
+            output_layer = self.output_layer
+        )['x']
+
+        batched_cluster_centers = repeat(self.cluster_centers, 'c d -> b c d', b = embed.shape[0])
+        dists = -torch.cdist(embed, batched_cluster_centers, p = 2)
+        clusters = dists.argmax(dim = -1)
+
+        if flatten:
+            return clusters
+
+        return rearrange(clusters, 'b ... -> b (...)')
+    
+
+class AudioConditionerBase(nn.Module):
+    pass
+
+
+def generate_mask_with_prob(shape, mask_prob, device):
+    seq = shape[-1]
+    rand = torch.randn(shape, device = device)
+    rand[:, 0] = -torch.finfo(rand.dtype).max
+    num_mask = min(int(seq * mask_prob), seq - 1)
+    indices = rand.topk(num_mask, dim = -1).indices
+    mask = ~torch.zeros(shape, device = device).scatter(1, indices, 1.).bool()
+    return mask
+
+
+
+def append_eos_id(ids, eos_id):
+    b, device = ids.shape[0], ids.device
+    eos_ids = torch.ones(1, device = device).long() * eos_id
+    eos_ids = repeat(eos_ids, '1 -> b 1', b = b)
+    ids = torch.cat((ids, eos_ids), dim = -1)
+    return ids
+
+def batch_unique_consecutive(t, pad_value = 0.):
+    unique_arr = [torch.unique_consecutive(el) for el in t.unbind(dim = 0)]
+    return pad_sequence(unique_arr, batch_first = True, padding_value = pad_value)
