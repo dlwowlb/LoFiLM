@@ -103,21 +103,31 @@ class SemanticTransformer(nn.Module):
         return_kv_cache = False,
         **kwargs
     ):
-        kv_cache = iter(default(kv_cache, []))
+        kv_cache = iter(default(kv_cache, [])) #kv캐시 있으면 이터레이터, 없으면 빈 리스트로 이터레이터
         new_kv_caches = []
 
-        logits, new_kv_cache = self.forward(*args, cond_drop_prob = 0., kv_cache = next(kv_cache, None), return_kv_cache = True, **kwargs)
+        #next(kv_cache, None)는 kv_cache의 값을 차례대로 반환, 없으면 None 반환
+        logits, new_kv_cache = self.forward(*args, cond_drop_prob = 0., 
+                                            kv_cache = next(kv_cache, None), 
+                                            return_kv_cache = True, **kwargs)
         new_kv_caches.append(new_kv_cache)
 
+        #cond_scale이 1이면 그대로 반환
         if cond_scale == 1 or not self.has_condition:
             if not return_kv_cache:
                 return logits
 
             return logits, torch.stack(new_kv_caches)
 
-        null_logits, null_new_kv_cache = self.forward(*args, cond_drop_prob = 1., kv_cache = next(kv_cache, None), return_kv_cache = True, **kwargs)
+        #null 조건은 마스킹 비율을 1로 설정해서 unconditional로 만듬
+        #unconditional이랸 조건(텍스트, 이미지 등)이 없이 학습된 내재 지식을 바탕으로 예측
+        null_logits, null_new_kv_cache = self.forward(*args, cond_drop_prob = 1., 
+                                                      kv_cache = next(kv_cache, None), 
+                                                      return_kv_cache = True, **kwargs)
         new_kv_caches.append(null_new_kv_cache)
 
+        #조건이 적용된 예측값과 조건이 제거된 예측값의 차이에 cond_scale을 곱함
+        #classifier-free guidance를 위한 방법
         scaled_logits = null_logits + (logits - null_logits) * cond_scale
 
         if not return_kv_cache:
