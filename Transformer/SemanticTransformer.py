@@ -390,6 +390,8 @@ class SemanticTransformerWrapper(nn.Module):
         sample_semantic_ids = ids.clone()
 
         #시퀸스에서 패딩 토큰이 아닌 토큰의 개수, 유효 토큰의 마지막 인덱스 구함
+        #패딩이 아니면 1, 패딩이면 0으로 표시
+        #마지막 유효한 토큰의 인덱스(배치별로 패딩이 아닌 토큰의 개수)
         last_logit_indices = (ids != self.pad_id).sum(dim = -1).long()
 
         # kv cache
@@ -401,6 +403,7 @@ class SemanticTransformerWrapper(nn.Module):
 
         for ind in tqdm(range(start_length, max_length), desc = 'generating semantic'):
 
+            #조건 스케일링을 적용하여 logits 생성
             new_logits, new_kv_cache = self.transformer.forward_with_cond_scale(
                 ids = sample_semantic_ids,
                 text_embeds = text_embeds,
@@ -410,15 +413,16 @@ class SemanticTransformerWrapper(nn.Module):
                 **kwargs
             )
 
+            #캐시가 있으면 새로운 로짓과 합침
             if use_kv_cache:
                 kv_cache = new_kv_cache
                 logits = safe_cat(logits, new_logits, dim = -2)
             else:
                 logits = new_logits
 
+            #repeat은 특정 차원으로 확장, logits.shape[-1]은 
             last_logit_indices_expanded = repeat(last_logit_indices, 'b -> b 1 c', b = batch, c = logits.shape[-1])
             last_logits = logits.gather(1, last_logit_indices_expanded)
-
             last_logits = rearrange(last_logits, 'b 1 c -> b c')
 
             filtered_logits = top_k(last_logits, thres = filter_thres)

@@ -479,3 +479,15 @@ def append_eos_id(ids, eos_id):
 def batch_unique_consecutive(t, pad_value = 0.):
     unique_arr = [torch.unique_consecutive(el) for el in t.unbind(dim = 0)]
     return pad_sequence(unique_arr, batch_first = True, padding_value = pad_value)
+
+
+#텐서가 존재하는지 확인하고 있으면 cat, 없으면 None 반환
+def safe_cat(*tensors, dim = -2):
+    args = [*filter(exists, tensors)]
+
+    if len(args) == 0:
+        return None
+    elif len(args) == 1:
+        return args[0]
+    else:
+        return torch.cat(args, dim = dim)
