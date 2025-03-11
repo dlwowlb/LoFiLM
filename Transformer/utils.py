@@ -476,12 +476,22 @@ def append_eos_id(ids, eos_id):
     ids = torch.cat((ids, eos_ids), dim = -1)
     return ids
 
+#중복된 값 제거 후 pad_value로 채워서 각 시퀀스 길이 맞추기기
 def batch_unique_consecutive(t, pad_value = 0.):
     unique_arr = [torch.unique_consecutive(el) for el in t.unbind(dim = 0)]
     return pad_sequence(unique_arr, batch_first = True, padding_value = pad_value)
 
+#일시적으로 eval 모드로 전환, 그 후 다시 훈련 모드로 복원하기 위함함
+def eval_decorator(fn):
+    def inner(model, *args, **kwargs):
+        was_training = model.training
+        model.eval()
+        out = fn(model, *args, **kwargs)
+        model.train(was_training)
+        return out
+    return inner
 
-#텐서가 존재하는지 확인하고 있으면 cat, 없으면 None 반환
+#여러 텐서 *로 한번에 받아서 연결결
 def safe_cat(*tensors, dim = -2):
     args = [*filter(exists, tensors)]
 
