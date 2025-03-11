@@ -21,3 +21,5 @@ Todo
 - [ ]  추상 베이스 클래스의 역할 이해
 - [ ]  X_Clip (BPE 없이) 토크나이저
 - [ ]  Semantic, Coarse, Fine Transformer의 차이점
+- [ ]  logic gather 부분 다시 이해
+- [ ]  Gumbel-Max Trick 설명

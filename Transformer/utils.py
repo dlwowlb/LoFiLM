@@ -6,6 +6,8 @@ from torch import nn, einsum, Tensor
 from einops import rearrange, repeat, reduce, pack, unpack
 from torch.nn.utils.rnn import pad_sequence
 from functools import partial, wraps
+import torch.nn.functional as F
+
 
 from beartype import beartype
 from beartype.typing import Union, List
@@ -186,6 +188,11 @@ def prob_mask_like(shape, prob, device):
         return torch.zeros(shape, device = device, dtype = torch.bool)
     else:
         return torch.zeros(shape, device = device).float().uniform_(0, 1) < prob
+    
+
+#gradient scaling
+def grad_shrink(t, alpha = 0.1):
+    return t * alpha + t.detach() * (1 - alpha)
 
 class Transformer(nn.Module):
     def __init__(
@@ -501,3 +508,44 @@ def safe_cat(*tensors, dim = -2):
         return args[0]
     else:
         return torch.cat(args, dim = dim)
+    
+#top_k개의 값만 남기고 나머지는 -inf로 채움
+#절반만 남기고 나머지는 -inf로 채움
+def top_k(logits, thres = 0.5):
+    num_logits = logits.shape[-1]
+    k = max(int((1 - thres) * num_logits), 1)
+    val, ind = torch.topk(logits, k)
+    probs = torch.full_like(logits, float('-inf'))
+    probs.scatter_(1, ind, val)
+    return probs
+
+#Gumble-max 트릭
+#확률 계산 없이 최댓값 연산으로 샘플링
+def log(t, eps = 1e-20): #아주 작은 값 더해 0도 가능하도록록
+    return torch.log(t + eps)
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+def gumbel_sample(t, temperature = 1., dim = -1):
+    return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
+
+#텐서 t의 모든 행이 적어도 하나의 eos_id(end of sequence)를 가지는지 확인
+def all_rows_have_eos_id(t, eos_id):
+    eos_mask = (t == eos_id)
+    return torch.any(eos_mask, dim = -1).all()
+
+#시퀀스에서 EOS(end-of-sequence) 토큰 이후의 모든 값을 특정 값(기본값은 -1)으로 마스킹(바꾸는)하는 역할
+#keep_eos=True이면 EOS 토큰은 유지되고 그 이후의 토큰들만 마스킹
+#keep_eos=False이면 EOS 토큰부터 이후의 모든 토큰이 마스킹됩니다.
+def mask_out_after_eos_id(t, eos_id, mask_value = -1, keep_eos = True):
+    #EOS 토큰이 있는 위치는 1.0으로 표시
+    eos_mask = (t == eos_id).float()
+
+    #마지막 차원에서 왼쪽에 0을 한 칸 추가하고 오른쪽 끝의 한 칸을 제거하여, 
+    #EOS 토큰이 있는 위치가 마스킹 기준에 포함되지 않도록 시프트
+    if keep_eos:
+        eos_mask = F.pad(eos_mask, (1, -1))
+
+    #EOS 토큰 이후(또는 keep_eos=False인 경우 EOS 토큰부터)의 모든 위치에 대해 True가 되는 마스크를 생성
+    after_eos_mask = eos_mask.cumsum(dim = -1) > 0
+    return t.masked_fill(after_eos_mask, mask_value)

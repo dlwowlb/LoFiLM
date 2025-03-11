@@ -200,7 +200,7 @@ class SemanticTransformer(nn.Module):
 
         #utils.py에 있는 Transformer 클래스의 forward 함수 호출
         #key value cache가 있으면 사용
-        #key value cache는 한 토큰씩 생성할 때 이전 토큰들에서 이미 계산된 key, value 재사용용
+        #key value cache는 한 토큰씩 생성할 때 이전 토큰들에서 이미 계산된 key, value 재사용
         tokens, kv_cache = self.transformer(tokens, context = text_embeds, self_attn_mask = self_attn_mask, context_mask = text_mask, kv_cache = kv_cache, return_kv_cache = True)
         logits = self.to_logits(tokens)
 
@@ -420,17 +420,22 @@ class SemanticTransformerWrapper(nn.Module):
             else:
                 logits = new_logits
 
-            #repeat은 특정 차원으로 확장, logits.shape[-1]은 
+            # repeat은 특정 차원으로 확장, 
+            # last_logit_indices은 배치 모양
+            # logits.shape[-1]은 logits의 마지막 차원 크기
+            # rearrange로 차원 제거
             last_logit_indices_expanded = repeat(last_logit_indices, 'b -> b 1 c', b = batch, c = logits.shape[-1])
-            last_logits = logits.gather(1, last_logit_indices_expanded)
+            last_logits = logits.gather(1, last_logit_indices_expanded) #모양은 [batch, 1, c]
             last_logits = rearrange(last_logits, 'b 1 c -> b c')
 
             filtered_logits = top_k(last_logits, thres = filter_thres)
             sampled = gumbel_sample(filtered_logits, temperature = temperature, dim = -1)
 
+            # ids로 저장되어 있던 기존 시퀀스에 결합합
             sampled = rearrange(sampled, 'b -> b 1')
             sample_semantic_ids = torch.cat((sample_semantic_ids, sampled), dim = -1)
 
+            #결합하다가 eos_id(end-of-sequence)를 만나면 중단
             if all_rows_have_eos_id(sample_semantic_ids, self.eos_id):
                 break
 
