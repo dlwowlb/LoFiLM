@@ -1,3 +1,5 @@
+
+
 class AudioLM(nn.Module):
     @beartype
     def __init__(
@@ -90,6 +92,7 @@ class AudioLM(nn.Module):
             prime_wave_input_sample_hz = prime_wave_input_sample_hz,
             max_length = max_length
         )
+
 
         coarse_token_ids_or_recon_wave = self.coarse.generate(
             text_embeds = text_embeds if self.coarse_has_condition else None,
