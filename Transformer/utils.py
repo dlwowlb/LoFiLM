@@ -22,6 +22,9 @@ import logging
 import joblib
 import fairseq
 
+#bytedance paper
+from hyper_connections import get_init_and_expand_reduce_stream_functions
+
 
 
 def noop(*args, **kwargs):
@@ -195,6 +198,7 @@ def prob_mask_like(shape, prob, device):
 def grad_shrink(t, alpha = 0.1):
     return t * alpha + t.detach() * (1 - alpha)
 
+
 class RelativePositionBias(nn.Module):
     """ from https://arxiv.org/abs/2111.09883 """
 
@@ -219,6 +223,7 @@ class RelativePositionBias(nn.Module):
         return next(self.parameters()).device
 
     def forward(self, i, j):
+        #i는 query, j는 key
         assert j >= i
         device = self.device
 
@@ -236,6 +241,160 @@ class RelativePositionBias(nn.Module):
 
         x = x[rel_pos]
         return rearrange(x, 'i j h -> h i j')
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+        self.register_buffer("beta", torch.zeros(dim))
+
+    def forward(self, x):
+        return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        causal = False,
+        dim_head = 64,
+        dim_context = None,
+        heads = 8,
+        norm_context = False,
+        num_null_kv = 0,
+        dropout = 0.1,
+        scale = 8,
+        flash = False
+    ):
+        super().__init__()
+        self.heads = heads
+        self.causal = causal
+        inner_dim = dim_head * heads
+
+        dim_context = default(dim_context, dim)
+
+        self.norm = LayerNorm(dim)
+        self.context_norm = LayerNorm(dim_context) if norm_context else nn.Identity()
+
+        self.attn_dropout = nn.Dropout(dropout)
+
+        self.num_null_kv = num_null_kv
+        self.null_kv = nn.Parameter(torch.randn(2, num_null_kv, dim_head)) if num_null_kv > 0 else None
+
+        self.to_q = nn.Linear(dim, inner_dim, bias = False)
+        self.to_kv = nn.Linear(dim_context, dim_head * 2, bias = False)
+
+        self.attend = Attend(
+            flash = flash,
+            dropout = dropout,
+            causal = causal
+        )
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim, bias = False),
+            nn.Dropout(dropout)
+        )
+
+    def forward(
+        self,
+        x,
+        context = None,
+        mask = None,
+        attn_bias = None,
+        prefix_context = None,
+        prefix_context_mask = None,
+        return_kv_cache = False,
+        return_values = False,
+        value_residual: Tensor | None = None,
+        kv_cache = None
+    ):
+        b, n, _, device = *x.shape, x.device
+
+        if exists(context):
+            context = self.context_norm(context)
+
+        kv_input = default(context, x)
+
+        # take care of prefix-based self attention conditioning
+        # make sure to either concat the to the self attention mask or lengthen it accordingly
+
+        if exists(prefix_context):
+            kv_input = torch.cat((prefix_context, kv_input), dim = -2)
+            prefix_seq_len = prefix_context.shape[-2]
+
+            if not exists(mask):
+                mask = torch.ones((b, n), device = device, dtype = torch.bool)
+
+            if exists(prefix_context_mask):
+                mask = torch.cat((prefix_context_mask, mask), dim = -1)
+            else:
+                mask = F.pad(mask, (prefix_seq_len, 0), value = True)
+
+            if exists(attn_bias):
+                attn_bias = F.pad(attn_bias, (prefix_seq_len, 0), value = 0.)
+
+        # prenorm
+
+        x = self.norm(x)
+
+        # project for queries, keys, values
+
+        q, k, v = self.to_q(x), *self.to_kv(kv_input).chunk(2, dim = -1)
+
+        # for value residual learning
+
+        orig_v = v
+
+        if exists(value_residual):
+            v = 0.5 * (v + value_residual)
+
+        # kv cache
+
+        if exists(kv_cache):
+            ck, cv = kv_cache
+            k = torch.cat((ck, k), dim = -2)
+            v = torch.cat((cv, v), dim = -2)
+
+        # store kv cache
+
+        if return_kv_cache:
+            kv_cache = torch.stack((k, v))
+
+        # null key / values
+
+        if self.num_null_kv > 0:
+            null_k, null_v = repeat(self.null_kv, 'kv n d -> kv b n d', b = b).unbind(dim = 0)
+            k = torch.cat((null_k, k), dim = -2)
+            v = torch.cat((null_v, v), dim = -2)
+
+        # split for multi-headed attention
+
+        q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
+
+        # handle mask and null key / value
+
+        if exists(mask):
+            mask = F.pad(mask, (self.num_null_kv, 0), value = True)
+
+        # attention
+
+        out = self.attend(q, k, v, attn_bias = attn_bias, mask = mask)
+
+        # merge heads
+
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = self.to_out(out)
+
+        if not return_kv_cache and not return_values:
+            return out
+
+        if return_kv_cache and not return_values:
+            return out, kv_cache
+
+        if return_values and not return_kv_cache:
+            return out, orig_v
+
+        return out, (kv_cache, orig_v)
 
 class Transformer(nn.Module):
     def __init__(
@@ -271,8 +430,8 @@ class Transformer(nn.Module):
 
         self.rel_pos_bias = RelativePositionBias(dim = dim // 2, heads = heads) if rel_pos_bias else None
 
-        # hyper connections
-
+        # hyper connections(bytedance에서 만든 residual 쉽게 하는 모듈)
+        # stream을 여러개 만들어서 다시 합친다.
         init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
 
         # layers
