@@ -245,6 +245,7 @@ class RelativePositionBias(nn.Module):
         return rearrange(x, 'i j h -> h i j')
 
 
+#입력을 두 부분으로 나눠서 하나는 GELU, 하나는 게이트
 class GEGLU(nn.Module):
     def forward(self, x):
         x, gate = x.chunk(2, dim = -1)
@@ -453,6 +454,7 @@ class Transformer(nn.Module):
 
         # hyper connections(bytedance에서 만든 residual 쉽게 하는 모듈)
         # stream을 여러개 만들어서 다시 합친다.
+        # Residual connection을 여러개 만드는 것
         init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, disable = num_residual_streams == 1)
 
         # layers
