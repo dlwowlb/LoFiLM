@@ -9,8 +9,9 @@ Todo
 - [x]  Mulan 모듈로 Audio, Text를 공통된 latent 차원으로 변환
 - [x]  Text, Audio 두 modality의 임베딩 간의 contrastive loss 모듈 만들기
 - [x]  Mulan의 출력을 RVQ 코드북으로 quantize
-- [ ]  Audiolm에서 Semantic Transformer를 사용한 조건 임베딩 토큰 생성
-- [ ]  토큰 생성 후 soundstream decoder로 여러 음악 샘플 생성 및 MuLaN으로 selecting
+- [x]  Audiolm에서 Semantic Transformer를 사용한 조건 임베딩 토큰 생성
+- [x]  토큰 생성 후 soundstream decoder로 여러 음악 샘플 생성 및 MuLaN으로 selecting
+- [ ]  MuLaN 대신 CLap으로 대체, Soundstream 대신 Encodec으로 대체
 - [ ]  Lo-Fi 스타일만 생성하도록 fine-tunning, AWS 이용
 - [ ]  허깅페이스 space에 올리기
 
